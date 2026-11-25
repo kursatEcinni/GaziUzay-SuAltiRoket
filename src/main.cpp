@@ -1,37 +1,3 @@
-// =====================================================================
-//  Subrocket controller - WORK IN PROGRESS (not a working mission yet)
-//
-//  Target: ESP32-S3 (Arduino framework / PlatformIO)
-//  Libraries: TaskScheduler, Adafruit BNO055, Adafruit Unified Sensor, ESP32Servo
-//
-//  STATUS
-//    - Syntax-checked on a PC with stub headers only. NOT yet built with the
-//      real libraries and NOT yet run on hardware.
-//    - Gains, mixer signs, ESC pulse range and axis mapping are starting
-//      values and must be verified on the bench (propeller removed).
-//
-//  KNOWN ISSUES
-//    1. updateFins(): the servo write is a placeholder. Servos are not attached,
-//       so the fins do not move yet.
-//    2. readDepth(): the map() line collapses the value to ~0 (integer math and
-//       wrong input range). Depth always reads 0 until it is removed or replaced
-//       with the real sensor conversion.
-//    3. calcEstDistance(): placeholder with a fixed 1.5 m/s. Distance only grows,
-//       so state 5 (return to start zone) can never be reached without forcing it.
-//    4. updateState(), state 3 -> 4: uses an absolute heading (yaw >= 180). It must
-//       become "heading ramp finished and heading error small", relative to yaw0.
-//    5. updateState(), state 5: disarmThrusters() and safeZoneProtocol() run every
-//       20 ms, so "Mission Completed" repeats and delay(100) blocks the scheduler.
-//       The final actions must run once.
-//    6. readIMU() / readDepth() / calcEstDistance() print at 5-50 Hz and flood
-//       the serial port. Move them to one slow debug task.
-//    7. No failsafe yet: no IMU timeout, depth limit or mission timeout. No
-//       check that bno.begin() succeeded.
-//    8. safeZoneProtocol() contains delay(100).
-//
-//  Pitch/roll axis assignment of the BNO055 depends on how the board is mounted.
-// =====================================================================
-
 #include <Arduino.h>
 #include <TaskScheduler.h>
 
@@ -40,6 +6,15 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 #include <ESP32Servo.h>   // generates the 50 Hz ESC pulse on the thruster pin
+
+// ---- HIL (hardware-in-the-loop) bench test ---------------------------------
+// Comment out the next line for the real vehicle.
+#define HIL_TEST
+#ifndef HIL_STAGE
+#define HIL_STAGE 1   // 1 = raw mixer test (pots -> fin commands)
+                      // 2 = closed-loop mission test (pot A = depth, pot B = distance)
+#endif
+// -----------------------------------------------------------------------------
 
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 
@@ -166,6 +141,17 @@ void initThruster();
 void writeThruster(float cmd01);
 //////////////// END NEW ////////////////
 
+//////////////// HIL TEST (NEW) ////////////////
+#ifdef HIL_TEST
+const int   distPotPin     = 5;        // pot B (ADC1): simulated distance, or yaw command in stage 1
+const float HIL_DIST_MAX_M = 80.0f;    // pot B full scale = 80 m (states change at 10 m and 60 m)
+bool  imuOk = false;                   // BNO055 found? if not, the attitude is simulated
+float simPitch = 0.0f, simRoll = 0.0f, simYaw = 0.0f;
+void simulateAttitude();
+void hilLog();
+#endif
+//////////////// END NEW ////////////////
+
 void readIMU();
 void readDepth();
 
@@ -202,6 +188,9 @@ Task taskDisarmThrusters(100, TASK_ONCE, &disarmThrusters);
 Task taskCalcPID(20, TASK_FOREVER, &calculatePID);
 Task taskUpdateFins(20, TASK_FOREVER, &updateFins);
 Task taskUpdateThrusters(20, TASK_FOREVER, &updateThrusters);
+#ifdef HIL_TEST
+Task taskHilLog(200, TASK_FOREVER, &hilLog);     // one readable status line, 5 times per second
+#endif
 
 //Task taskHealthCheck(200, TASK_FOREVER, &checkHealth);
 
@@ -223,6 +212,9 @@ void setup() {
   scheduler.addTask(taskCalcPID);
   scheduler.addTask(taskUpdateThrusters);
   scheduler.addTask(taskUpdateFins);
+#ifdef HIL_TEST
+  scheduler.addTask(taskHilLog);
+#endif
   //scheduler.addTask(taskHealthCheck);
 
   taskReadIMU.enable();
@@ -233,15 +225,28 @@ void setup() {
   taskCalcPID.enable();
   taskUpdateFins.enable();
   taskUpdateThrusters.enable();
+#ifdef HIL_TEST
+  taskHilLog.enable();
+#endif
   //taskHealthCheck.enable();
 
+#ifdef HIL_TEST
+  imuOk = bno.begin();                 // no BNO055? the attitude is simulated instead
+  if (imuOk) bno.setExtCrystalUse(true);
+#else
   bno.begin();
   bno.setExtCrystalUse(true);
+#endif
 
   pinMode(depthPin, INPUT);
   pinMode(initButton, INPUT_PULLDOWN);
 
   Serial.begin(115200);
+#ifdef HIL_TEST
+  pinMode(distPotPin, INPUT);
+  Serial.print("HIL test, stage "); Serial.println(HIL_STAGE);
+  Serial.println(imuOk ? "BNO055 found: real attitude" : "BNO055 NOT found: simulated attitude");
+#endif
 }
 
 ////////////////LOOP////////////////
@@ -259,25 +264,36 @@ void loop() {
 
 
 void readIMU(){
+#ifdef HIL_TEST
+  if (!imuOk) { simulateAttitude(); return; }
+#endif
   sensors_event_t event; 
   bno.getEvent(&event);
 
   yaw   = event.orientation.x; // 0 - 360 derece
   roll  = event.orientation.y; // -90 / +90
   pitch = event.orientation.z; // -180 / +180
+#ifndef HIL_TEST
   Serial.print("Pitch: "); Serial.print(pitch);
   Serial.print(" Roll: "); Serial.print(roll);
   Serial.print(" Yaw: "); Serial.println(yaw);
+#endif
 }
 void readDepth(){
   // Placeholder for depth reading code
   // After deciding on the depth sensor, implement the reading logic here
   // Simulate depth reading
-  depth = (analogRead(depthPin) / 4095.0f) * 10.0f;
-  depth = map(depth, 0, 1023, 0, 10); // Replace with actual depth reading logic
+  float m = (analogRead(depthPin) / 4095.0f) * 10.0f;   // pot 0..10 m (the old map() line made this ~0)
+  depth += 0.3f * (m - depth);                           // light low-pass against pot / ADC noise
+#ifndef HIL_TEST
   Serial.print("Depth: "); Serial.println(depth);
+#endif
 }
 void calcEstDistance(){
+#ifdef HIL_TEST
+  lastDistance = (analogRead(distPotPin) / 4095.0f) * HIL_DIST_MAX_M;   // pot B = simulated distance
+  return;
+#endif
   float currentDistance = lastDistance; // Placeholder for current distance calculation
   // Placeholder for distance calculation code
   // Implement the logic to calculate distance based on sensor readings
@@ -286,8 +302,10 @@ void calcEstDistance(){
   //ADD TURNING BACK LOGIC AND MINUS DISTANCE WHEN TURNING BACK !!!!!!!!!!!
   cruiseSpeed = 1.5f; // Replace with actual distance calculation logic
   lastDistance = currentDistance + cruiseSpeed * 0.1f; // Update last distance based on cruise speed and time interval
+#ifndef HIL_TEST
   Serial.print("Cruise Speed: "); Serial.println(cruiseSpeed);
   Serial.print("Estimated Distance: "); Serial.println(lastDistance);
+#endif
 }
 
 void updateState(){
@@ -305,7 +323,7 @@ void updateState(){
     missionState = 3;
     Serial.println("State: 3");
   }
-  else if(missionState == 3 && yaw >= 180.0f){
+  else if(missionState == 3 && turnRampDeg >= 180.0f && fabsf(wrap180(headingSP - yaw)) <= 10.0f){
     // make sure it is a 180 degree turn, you can add a tolerance if needed
     missionState = 4;
     Serial.println("State: 4");
@@ -315,9 +333,13 @@ void updateState(){
     Serial.println("State: 5");
   }
   else if(missionState == 5){
-    disarmThrusters();
-    safeZoneProtocol();
-    Serial.println("Mission Completed");
+    static bool finished = false;
+    if (!finished) {                 // run the final actions only once
+      finished = true;
+      disarmThrusters();
+      safeZoneProtocol();
+      Serial.println("Mission Completed");
+    }
   }
 }
 
@@ -427,6 +449,18 @@ void updateThrusters(){
 //           roll hold -> roll command
 // Only active in states 1..4. In every other state the commands are zero and the PIDs are reset.
 void calculatePID(){
+#if defined(HIL_TEST) && (HIL_STAGE == 1)
+  // STAGE 1: no PID. The pots and the button drive the three axis commands directly,
+  // so you can check servo directions and the mixer. Works in every state.
+  float pc = ((analogRead(depthPin) / 4095.0f) - 0.5f) * 2.0f;     // pot A -> pitch command -1..1
+  float yc = ((analogRead(distPotPin) / 4095.0f) - 0.5f) * 2.0f;   // pot B -> yaw command   -1..1
+  if (fabsf(pc) < 0.03f) pc = 0.0f;                                // dead zone around the centre
+  if (fabsf(yc) < 0.03f) yc = 0.0f;
+  pitchCmd = pc;
+  yawCmd   = yc;
+  rollCmd  = (digitalRead(initButton) == HIGH) ? 1.0f : 0.0f;      // button held -> roll +1
+  return;
+#endif
   static uint32_t lastMs = 0;
   static bool wasActive = false;
 
@@ -509,6 +543,46 @@ void updateFins(){
     }
   }
 }
+//////////////// END NEW ////////////////
+
+//////////////// HIL TEST FUNCTIONS (NEW) ////////////////
+#ifdef HIL_TEST
+// Only used when no BNO055 is connected: a toy "vehicle" that turns with the fin commands
+// (only while moving, states 1..4). It checks the control logic, not real signs.
+void simulateAttitude(){
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  float dt = (now - lastMs) / 1000.0f;
+  lastMs = now;
+  if (dt <= 0.0f || dt > 0.25f) dt = 0.02f;
+
+  if (missionState >= 1 && missionState <= 4) {
+    simPitch += 40.0f * pitchCmd * dt;   // deg/s at full command
+    simRoll  += 40.0f * rollCmd  * dt;
+    simYaw   += 30.0f * yawCmd   * dt;
+  }
+  pitch = simPitch;
+  roll  = simRoll;
+  yaw   = wrap360(simYaw);
+}
+
+// One status line, 5 times per second.
+void hilLog(){
+  Serial.print("S"); Serial.print(missionState);
+  Serial.print(" dist "); Serial.print(lastDistance, 1);
+  Serial.print(" depth "); Serial.print(depth, 2);
+  Serial.print(" | P "); Serial.print(pitch, 1);
+  Serial.print(" R "); Serial.print(roll, 1);
+  Serial.print(" Y "); Serial.print(yaw, 1);
+  Serial.print(" hdgSP "); Serial.print(headingSP, 0);
+  Serial.print(" | cmd p/y/r "); Serial.print(pitchCmd, 2);
+  Serial.print(" "); Serial.print(yawCmd, 2);
+  Serial.print(" "); Serial.print(rollCmd, 2);
+  Serial.print(" | fins");
+  for (int i = 0; i < 4; i++) { Serial.print(" "); Serial.print((int)finAngle[i]); }
+  Serial.println(imuOk ? " [IMU]" : " [SIM]");
+}
+#endif
 //////////////// END NEW ////////////////
 
 //void filterSensors(){delay(10);}
